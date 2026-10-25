@@ -2,54 +2,78 @@ name: CI
 
 on:
   push:
-    branches: [ master ]
+    branches: [master]
 
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
-    runs-on: macos-13
+    runs-on: macos-15
 
     steps:
-      - uses: actions/checkout@v2
+      - name: Checkout source
+        uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
-          fetch-depth: '0'
+          submodules: recursive
+          fetch-depth: 0
 
-      - name: Set active Xcode path
+      - name: Set up Xcode
         run: |
-          XCODE_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["xcode"]);')
-          sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer
+          set -euo pipefail
+
+          XCODE_VERSION=$(python3 -c \
+            'import json; print(json.load(open("versions.json"))["xcode"])')
+
+          XCODE_PATH="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+
+          if [ -d "$XCODE_PATH" ]; then
+            sudo xcode-select -s "$XCODE_PATH"
+          else
+            echo "Xcode $XCODE_VERSION is not installed on this runner."
+            echo "Available Xcode installations:"
+            ls -d /Applications/Xcode*.app 2>/dev/null || true
+            exit 1
+          fi
+
+          xcodebuild -version
+          xcodebuild -showsdks
 
       - name: Create canonical source directory
         run: |
-          set -x
+          set -euo pipefail
+
           sudo mkdir -p /Users/Shared
-          cp -R $GITHUB_WORKSPACE /Users/Shared/
-          mv /Users/Shared/$(basename $GITHUB_WORKSPACE) /Users/Shared/telegram-ios
+          sudo rm -rf /Users/Shared/telegram-ios
+          sudo cp -R "$GITHUB_WORKSPACE" /Users/Shared/telegram-ios
+          sudo chown -R "$(whoami)" /Users/Shared/telegram-ios
 
       - name: Build the App
         run: |
+          set -euo pipefail
           set -x
 
-          # source code paths are included in the final binary, so we need to make them stable across builds
-          SOURCE_DIR=/Users/Shared/telegram-ios
-
-          # use canonical bazel root
+          SOURCE_DIR="/Users/Shared/telegram-ios"
           BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
 
-          cd $SOURCE_DIR
+          cd "$SOURCE_DIR"
 
-          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
+          BUILD_NUMBER_OFFSET=$(cat build_number_offset)
 
-          export APP_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["app"]);')
-          export COMMIT_COUNT=$(git rev-list --count HEAD)
-          export COMMIT_COUNT="$(($COMMIT_COUNT+$BUILD_NUMBER_OFFSET))"
-          export BUILD_NUMBER="$COMMIT_COUNT"
-          echo "BUILD_NUMBER=$(echo $BUILD_NUMBER)" >> $GITHUB_ENV
-          echo "APP_VERSION=$(echo $APP_VERSION)" >> $GITHUB_ENV
+          APP_VERSION=$(python3 -c \
+            'import json; print(json.load(open("versions.json"))["app"])')
 
-          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          BUILD_NUMBER=$((COMMIT_COUNT + BUILD_NUMBER_OFFSET))
+
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+
+          python3 build-system/Make/ImportCertificates.py \
+            --path build-system/fake-codesigning/certs
+
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
             build \
@@ -58,20 +82,34 @@ jobs:
             --configuration=release_arm64 \
             --buildNumber="$BUILD_NUMBER"
 
-          # collect ipa
           OUTPUT_PATH="build/artifacts"
+
           rm -rf "$OUTPUT_PATH"
           mkdir -p "$OUTPUT_PATH"
+
+          IPA_FOUND=0
+
           for f in bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa; do
-            cp "$f" $OUTPUT_PATH/
+            if [ -f "$f" ]; then
+              cp "$f" "$OUTPUT_PATH/"
+              IPA_FOUND=1
+            fi
           done
 
-          # collect dsym
+          if [ "$IPA_FOUND" -eq 0 ]; then
+            echo "ERROR: Telegram.ipa was not generated."
+            exit 1
+          fi
+
           mkdir -p build/DSYMs
+
           for f in bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/*.dSYM; do
-            cp -R "$f" build/DSYMs/
+            if [ -d "$f" ]; then
+              cp -R "$f" build/DSYMs/
+            fi
           done
-          zip -r "./$OUTPUT_PATH/Telegram.DSYMs.zip" build/DSYMs 1>/dev/null
+
+          zip -r "$OUTPUT_PATH/Telegram.DSYMs.zip" build/DSYMs
 
       - name: Create Release
         id: create_release
@@ -82,12 +120,15 @@ jobs:
           tag_name: build-${{ env.BUILD_NUMBER }}
           release_name: Telegram ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})
           body: |
-            An unsigned build of Telegram for iOS ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }})
+            Unsigned Telegram iOS build.
+
+            Version: ${{ env.APP_VERSION }}
+            Build: ${{ env.BUILD_NUMBER }}
+            Target: ARM64 iOS devices.
           draft: false
           prerelease: false
 
       - name: Upload Release IPA
-        id: upload-release-ipa 
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -95,10 +136,9 @@ jobs:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: /Users/Shared/telegram-ios/build/artifacts/Telegram.ipa
           asset_name: Telegram.ipa
-          asset_content_type: application/zip
+          asset_content_type: application/octet-stream
 
       - name: Upload Release DSYM
-        id: upload-release-dsym 
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
